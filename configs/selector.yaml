@@ -1,0 +1,7 @@
+# Stage 5 ablation (plan Sec.12) — 핵심 비교는 mbd vs mbfd
+ratio_sweep: [0.1, 0.2, 0.3, 0.5]
+block_sweep: [1, 2, 4]               # Stage 7 structured sparsity
+selectors: [mask, mask_boundary, mask_delta, mask_frequency, mbd, mbfd, random, oracle]
+freq_source: anchor_x0               # TRUE anchor x0 = z_a - sigma_a*v_a (Fix 1)
+# 대안: cached_v_current_x0 (z_t + stale v_a 혼합 estimate; ablation 전용), noisy
+combo_weights: {alpha: 1.0, beta: 0.5, gamma: 1.0, delta: 1.0, eta: 0.0}

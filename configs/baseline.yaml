@@ -1,0 +1,6 @@
+# Stage 0-1: dense baselines (Gate A 이후 reduced-step sweep)
+model_id: black-forest-labs/FLUX.1-Fill-dev
+resolution: 512
+guidance_scale: 30.0
+dense_steps_sweep: [50, 40, 30, 25, 20, 15]
+seed_policy: manifest          # latent_seed는 manifest가 고정

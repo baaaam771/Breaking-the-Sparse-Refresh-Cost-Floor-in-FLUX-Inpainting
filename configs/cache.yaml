@@ -1,0 +1,5 @@
+# Stage 2/4: depth-aligned cache 설정
+cache_period_sweep: [2, 3, 4, 5]     # anchor 주기 c
+sparse_scope: single_stream          # 첫 PoC: dual dense + single sparse (plan Sec.3)
+easy_prediction: anchor_reuse        # easy 토큰 최종 출력 = anchor target prediction
+r0_reuse_baseline: true              # DACE r=0 anchored reuse를 항상 함께 실행

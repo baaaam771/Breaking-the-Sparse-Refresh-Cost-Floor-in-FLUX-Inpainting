@@ -1,0 +1,139 @@
+# FreqSpec-Cache-FLUX 구현 계획안
+
+**목표 시스템**
+
+```
+Frozen FLUX Fill target
++ mask/frequency-aware token routing      (FreqSpec: WACV #415, One-Verifier)
++ depth-aligned target cache              (DACE: AAAI 2027)
++ selective image-token refresh           (본 프로젝트의 신규 execution layer)
++ optional plug-in draft                  (selector / temporal correction)
+```
+
+세 편의 선행 연구가 각자 제공하는 것:
+
+| 선행 연구 | 가져오는 것 | 이 repo에서의 위치 |
+|---|---|---|
+| FreqSpec-Inpaint (WACV #415) | mask/boundary/frequency saliency prior, patch-wise 판단 | `token_selectors/{mask,boundary,frequency}.py` |
+| One Verifier (task-agnostic) | Ω를 바꿔도 동일한 acceptance core → 여기서는 Ω = FLUX packed image-token grid | `token_selectors/combo.py`, rank-norm 결합 |
+| DACE (AAAI) | depth-aligned anchor cache, fresh-cache exactness, anchor/delta selector, r=0 anchored reuse baseline | `models/flux_cache.py`, `models/flux_sparse_transformer.py`, `token_selectors/delta.py` |
+
+DACE의 핵심 교훈을 그대로 계승한다:
+1. **Frozen context는 실패한다** → easy 토큰은 절대 depth-m 상태로 얼리지 않고,
+   같은 depth의 anchor 상태(depth-correct, time-stale)로 대체한다.
+2. **Fresh cache exactness가 게이트다** → cache가 신선하면 sparse pass == dense pass
+   (max|Δ|≈0, bf16 rounding 제외)가 나와야만 실험을 진행한다.
+3. **r=0 anchored reuse가 가장 강한 draft-free baseline** → 모든 r>0 결과는
+   r=0과 reduced-step dense 곡선 위에서 해석한다.
+4. **DACE의 two-factor test**: temporal change가 (i) 크고 (ii) 공간적으로 집중되어야
+   selective correction이 이긴다. Inpainting은 masked region이 빠르게 변하고
+   context는 거의 안 변하므로 DACE가 예측한 "natural deployment"이며,
+   이 가설 검증 자체가 논문의 1차 기여가 된다 (`eval/heterogeneity.py`).
+
+---
+
+## FLUX.1 Fill [dev] 구조 전제
+
+- 12B rectified-flow transformer, `FluxFillPipeline` (diffusers)
+- dual-stream 19 blocks (`transformer_blocks`) + single-stream 38 blocks
+  (`single_transformer_blocks`), hidden 3072
+- in_channels 384 = packed latent 64 + masked-image latent 64 + packed mask 256
+- VAE 8× 압축 후 2×2 packing → 토큰 그리드 (H/16 × W/16)
+- scheduler: FlowMatchEulerDiscrete (dynamic shift), 모델 출력은 velocity v
+- clean estimate: x̂0 = z_t − σ_t · v  (DDPM 공식 사용 금지)
+
+**첫 구현 원칙 (안전 우선)**
+- dual-stream 19 blocks: dense 유지
+- single-stream 38 blocks: text 토큰은 항상 fresh(=query), hard image 토큰만 fresh,
+  easy image 토큰은 same-depth anchor cache가 K/V context로만 참여
+- easy 토큰의 최종 prediction: anchor의 target prediction 재사용 (DACE r=0/부분 correction)
+
+---
+
+## Stage 계획 ↔ 코드 매핑
+
+| Stage | 내용 | 실행 | Gate |
+|---|---|---|---|
+| 0 | 라이선스, 공식 baseline 재현, deterministic seed | `scripts/run_stage0_smoke.sh` → `samplers/dense_flux_fill.py --official` | 같은 seed 반복 시 출력 동일 |
+| 1 | pipeline 분해, custom dense loop | `samplers/dense_flux_fill.py --mode gate_a` (official↔custom↔runner 3중 비교) | **Gate A**: latent/pixel max err ≈ bf16 rounding |
+| 2 | block instrumentation + depth-aligned cache | `models/flux_cache.py`, `tests/test_cache_exactness.py` | **Gate B**: fresh-cache max\|Δv\| == 0 |
+| 3 | token/mask mapping 검증 | `utils/token_mapping.py`, `tests/test_token_mapping.py`, overlay 저장 | roundtrip 일치 + 시각화 |
+| 4 | mask-only selective refresh PoC | `samplers/cached_flux_fill.py --selector mask` | **Gate C/D**: mask 내부 Δ ≫ 외부, mask < random |
+| 5 | FreqSpec selector 전체 ablation | `token_selectors/*`, `scripts/run_stage3_selectors.sh` | M+B+Δ vs M+B+F+Δ (frequency 순수 기여) |
+| 6 | plug-in draft (selector → correction) | `models/drafts/*`, `training/` (차후), `samplers --draft` | **Gate G**: draft 포함 Pareto 개선 |
+| 7 | structured sparsity (2×2, 4×4, mask window) | `token_selectors/combo.py --block-structure` | **Gate F**: wall-clock T_sparse < T_dense |
+| 8 | 최종 5k/10k, 3 seeds, latency/VRAM | `eval/assemble.py`, `scripts/run_stage5_final.sh` | **Gate E**: 같은 품질에서 target compute↓ |
+
+필수 baseline (모두 `samplers/`에서 config로 전환):
+- dense 50-step / reduced-step {40,30,25,20,15}
+- cache-only (r=0 anchored reuse, anchor period c∈{2,3,4,5})
+- mask-only refresh / random same-budget / oracle
+- previous-step output reuse (naive) vs depth-aligned cache (DACE 비교군)
+
+---
+
+## 연구 질문 → 판정 실험
+
+| 질문 | 실험 | 판정 지표 |
+|---|---|---|
+| Q1. FLUX Fill에서도 변화가 mask/boundary에 집중되는가 | `eval/heterogeneity.py`: per-token δ_i(t), top-30% share, CV, in/out-mask ratio | in-mask share ≫ area share |
+| Q2. FreqSpec prior가 random보다 hard token을 잘 찾는가 | selector sweep, oracle 대비 captured-change / quality | combo < random error, oracle gap |
+| Q3. depth-aligned cache + selective refresh로 품질·latency 동시 개선 | Stage 7–8 Pareto | Gate E, F |
+| Q4. draft가 FreqSpec+cache 대비 추가 정보를 주는가 | draft selector / temporal correction vs draft-free | Gate G |
+
+---
+
+## 디렉토리
+
+```
+flux_fill_sparse/
+├── PLAN.md                      # 이 문서
+├── configs/                     # baseline / cache / selector / draft yaml
+├── data/                        # dataset.py masks.py prompt_cache.py
+├── models/
+│   ├── flux_fill_loader.py      # 로딩 + 구조 검증(assert) + 메모리 전략
+│   ├── flux_cache.py            # FluxAnchorCache (depth-aligned)
+│   ├── flux_sparse_transformer.py  # dense/sparse/anchor forward (핵심)
+│   └── drafts/cnn_router.py     # plug-in draft (Stage 6, selector-only 먼저)
+├── token_selectors/          # (주의: stdlib selectors와 충돌 방지 위해 개명)                   # mask boundary frequency delta draft combo
+├── samplers/
+│   ├── dense_flux_fill.py       # Stage 0–1: official ↔ custom equivalence
+│   └── cached_flux_fill.py      # Stage 4–7: anchor + sparse refresh 루프
+├── eval/                        # region_metrics latency heterogeneity assemble
+├── tests/                       # Gate A/B + token mapping + scheduler
+├── utils/                       # token_mapping seeds flow_math
+└── scripts/                     # run_stage0..5
+```
+
+## 환경
+
+```bash
+conda create -n fluxspec python=3.11 -y && conda activate fluxspec
+pip install -r requirements.txt
+hf auth login        # FLUX.1-Fill-dev 라이선스 동의 후
+```
+
+`requirements.txt`는 diffusers 버전을 고정한다. `flux_fill_loader.py`가 로드 직후
+블록 수(19/38)·in_channels(384)·single-block 속성(norm/proj_mlp/attn/proj_out)을
+assert하고, 불일치 시 어떤 diffusers 버전을 쓰라는 메시지와 함께 즉시 실패한다.
+
+---
+
+## 리뷰 반영 (2026-07-08 수정 배치)
+
+| # | 문제 | 수정 |
+|---|------|------|
+| 1 | `anchor_x0`가 z_t + stale v_a 혼합 estimate | `FluxAnchorCache.set_anchor_context()`가 anchor step에서 x̂₀ₐ = z_a − σ_a·v_a 를 정확히 저장; 기존 방식은 `cached_v_current_x0` ablation arm으로 분리 |
+| 2 | 실제 FLUX block equivalence gate 부재 | Gate ladder B0(`tests/test_single_block_equivalence.py`) → B1(gate_a) → B2(cache exactness); loader가 `FluxAttnProcessor2_0`/QK RMSNorm/fused-QKV/added-KV를 hard-assert |
+| 3 | block selection이 smoothing + token Top-K | `block_hard_easy_split`: block 평균 → **block 단위 Top-K** → 토큰 확장. k = kb·b² 보장, `r(actual)` 기록·보고 |
+| 4 | two-factor 중 consequence 미측정 | hetero row에 E_rel = ‖Δv‖²/‖v‖² 추가; `eval.heterogeneity`가 dense sweep의 mask LPIPS 악화량(S_step)과 결합해 2×2 verdict 산출 |
+| 5 | `LPIPS_t` 명칭 오류 | 전 metric `*_to_ref`로 개명 (최종 출력 divergence임을 명시) |
+| 6 | known-region 평가 부족 | raw + pasted(M·x_model+(1−M)·x_input) 출력 분리 저장; `--manifest`로 원본 입력 대비 `known_psnr_to_input` 측정 |
+| 7 | VRAM/latency 측정 오염 | sample별 sync+reset 후 측정 시작, 첫 sample warm-up 플래그(assemble에서 wall 제외), latency는 config별 peak 분리 |
+| 8 | Stage 6 골격만 존재 | `dump_router_teacher`(trajectory dump, resumable/atomic) + `training/train_router`(EMA·rolling ckpt·resume·AUROC) + `RouterDraft` + `--draft-ckpt` + 실행 스크립트 |
+| 9 | Stage 8 미구현 | `run_stage5_final.sh`: 3 seed offsets × 전체 suite → seed 평균±std 테이블 + Pareto CSV + latency |
+| 10 | compute claim 과대 위험 | `estimate_transformer_macs`: dense dual 19 blocks + full-S K/V/norm 비용 포함한 전체 MAC ratio를 stats/latency/테이블에 분리 보고 |
+
+### 3차 리뷰 반영 (2026-07-08)
+- **Stable mask seed (필수)**: `data/masks.py`의 builtin `hash()` (프로세스별 salt로 비결정적) → `stable_seed()` (SHA-256 기반)으로 교체. `test_mask_determinism_across_processes`가 서로 다른 `PYTHONHASHSEED`의 두 subprocess에서 mask checksum 일치를 검증. 주의: seed 산출 방식이 바뀌었으므로 이 수정 이전에 생성된 mask/결과와는 호환되지 않음 (아직 본 실험 전이므로 영향 없음).
+- **Brush mask 속도**: 전체 H×W distance test → 원 bounding-box stamping (O(r²)/point). 9개 (type×bucket) 생성 40s+ → 0.1s.

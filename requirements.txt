@@ -1,0 +1,17 @@
+# python 3.11 권장 (plan Sec. 4)
+torch>=2.4
+torchvision
+diffusers==0.32.2        # FluxFillPipeline / FluxTransformer2DModel 구조 고정
+transformers>=4.44
+accelerate
+safetensors
+huggingface_hub>=1.0     # CLI는 `hf download` 형식 사용 (huggingface-cli 제거됨)
+sentencepiece
+protobuf
+lpips
+PyWavelets
+clean-fid
+torchmetrics
+numpy
+Pillow
+PyYAML
