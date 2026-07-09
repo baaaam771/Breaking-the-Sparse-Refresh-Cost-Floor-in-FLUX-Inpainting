@@ -124,7 +124,7 @@ def load_text_encoders_only(model_id: str = MODEL_ID, device: str = "cuda"):
     from diffusers import FluxFillPipeline
 
     pipe = FluxFillPipeline.from_pretrained(
-        model_id, transformer=None, vae=None, torch_dtype=torch.bfloat16,
+        model_id, transformer=None, torch_dtype=torch.bfloat16,
     )
     pipe.to(device)
     return _TextEncoderOnly(pipe, device)
