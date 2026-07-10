@@ -233,6 +233,8 @@ def main():
                     help="added to each sample's manifest latent_seed (Stage 8 multi-seed)")
     ap.add_argument("--draft-ckpt", default="",
                     help="CNN router checkpoint for mbfd_draft (Stage 6)")
+    ap.add_argument("--prefetch", action=__import__("argparse").BooleanOptionalAction,
+                    default=True, help="background next-sample loading (--no-prefetch로 끔)")
     ap.add_argument("--tag", default="run")
     a = ap.parse_args()
 
@@ -248,9 +250,23 @@ def main():
     ds = FluxFillBenchmark(a.manifest)
     n = len(ds) if a.limit == 0 else min(a.limit, len(ds))
 
+    # 다음 sample(이미지 로드 + mask 생성)을 GPU가 도는 동안 백그라운드로 준비.
+    # sample당 50-step FLUX(수십 초) 대비 데이터(수십 ms)라 이득은 작지만 공짜이고,
+    # rows[i]["data_s"]로 데이터가 GPU를 실제로 막는지 직접 확인 가능.
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=1) if a.prefetch else None
+    pending = pool.submit(ds.__getitem__, 0) if pool else None
+
     rows = []
     for i in range(n):
-        s = ds[i]
+        t_data = time.perf_counter()
+        if pool:
+            s = pending.result()
+            if i + 1 < n:
+                pending = pool.submit(ds.__getitem__, i + 1)
+        else:
+            s = ds[i]
+        data_s = time.perf_counter() - t_data
         pe = po = None
         if a.prompt_cache:
             pe, po = load_cached(a.prompt_cache, s["prompt"], dev, dtype)
@@ -275,6 +291,7 @@ def main():
         torch.cuda.synchronize()
         log.update({"sample_id": s["sample_id"], "bucket": s["bucket"],
                     "mask_type": s["mask_type"], "warmup": i == 0,
+                    "data_s": data_s,
                     "wall_s": time.perf_counter() - t0,
                     "peak_vram_gb": torch.cuda.max_memory_allocated() / 2**30})
         rows.append(log)

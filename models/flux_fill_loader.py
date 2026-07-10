@@ -120,7 +120,10 @@ class _TextEncoderOnly:
 
 
 def load_text_encoders_only(model_id: str = MODEL_ID, device: str = "cuda"):
-    """Load pipeline WITHOUT transformer/vae weights to encode prompts cheaply."""
+    """Load pipeline WITHOUT the 12B transformer to encode prompts cheaply.
+    NOTE: vae must NOT be None — FluxFillPipeline.__init__ reads
+    self.vae.config.latent_channels at construction time. The VAE is ~300MB
+    and stays idle here; only the transformer is skipped."""
     from diffusers import FluxFillPipeline
 
     pipe = FluxFillPipeline.from_pretrained(

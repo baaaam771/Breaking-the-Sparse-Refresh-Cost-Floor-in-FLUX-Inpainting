@@ -64,3 +64,19 @@ N=10000 MAN=data/coco_manifest_10k.json bash scripts/run_stage5_final.sh   # fin
   학습해 AUROC를 확인한 뒤에만 확대할 것.
 - Gate B0/B2의 fp32 tol은 1e-5 (SDPA kernel 선택에 따른 reduction 오차 여지);
   bf16은 3e-2 / 2e-2. 실제 측정값을 보고 조정.
+
+## Worker / throughput 튜닝
+```bash
+# 1) DataLoader 단독 벤치 (실제 dataset 클래스 + 실제 mask 생성 비용 포함)
+bash scripts/bench_workers_sweep.sh
+
+# 2) 최종 판단은 실제 sampler wall-clock: run.json의 per-sample "data_s"를 확인
+#    data_s가 step당 GPU 시간 대비 무시 가능(<1%)하면 워커 튜닝은 sampling에 불필요
+python -m samplers.cached_flux_fill ... --tag probe --limit 5      # prefetch 기본 ON
+python -m samplers.cached_flux_fill ... --no-prefetch              # 비교용
+```
+- Sampler는 batch=1로 sample당 50-step FLUX forward가 지배적이라, 데이터 로딩은
+  기본 `--prefetch`(백그라운드 1-lookahead)로 충분히 가려짐. `nvidia-smi dmon`으로
+  GPU util이 출렁이면 그때 `data_s` 로그부터 확인.
+- Router 학습이 I/O bound면 `training/train_router.py`의 shard LRU 캐시(기본 8)를
+  키우는 것이 DataLoader worker보다 먼저다 (shard당 ~13MB, RAM 여유만큼).
