@@ -136,6 +136,8 @@ def main():
 
     x, ctx = runner._dual_stream(x, ctx, temb, cos, sin)
     cat0 = torch.cat([ctx, x], dim=1)                      # single-stack entry
+    print(f"[P0] |cat0| max = {cat0.float().abs().max().item():.3e} "
+          f"(랜덤 입력의 dual-stream 활성 폭발 확인용)")
     blk0 = t.single_transformer_blocks[0]
 
     # ---------------- Phase 1: real block0, full-seq sparse fn ----------------
