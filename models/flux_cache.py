@@ -63,6 +63,11 @@ class FluxAnchorCache:
         self.timestep = timestep
         self.step_index = step_index
         self.single_block_inputs = []
+        self.single_block_kv = []
+
+    def record_single_kv(self, k_img: torch.Tensor, v_img: torch.Tensor):
+        self.single_block_kv.append((k_img.detach().contiguous(),
+                                     v_img.detach().contiguous()))
 
     def record_single_input(self, image_states: torch.Tensor):
         # detach + contiguous: cache must never keep autograd graph or views alive
@@ -78,6 +83,9 @@ class FluxAnchorCache:
         n = 0
         for t in self.single_block_inputs:
             n += t.numel() * t.element_size()
+        for kv in self.single_block_kv:
+            total += kv[0].numel() * kv[0].element_size()
+            total += kv[1].numel() * kv[1].element_size()
         for t in (self.entry_image_states, self.entry_text_states, self.final_prediction,
                   self.anchor_latents, self.anchor_clean_estimate):
             if t is not None:

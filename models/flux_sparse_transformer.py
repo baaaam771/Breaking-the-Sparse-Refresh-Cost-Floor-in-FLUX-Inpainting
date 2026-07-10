@@ -89,8 +89,12 @@ def prepare_latent_image_ids(hp: int, wp: int, device, dtype) -> torch.Tensor:
 
 # --------------------------------------------------------------- single blk ---
 def _single_block_dense(block, x: torch.Tensor, temb: torch.Tensor,
-                        cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Manual FluxSingleTransformerBlock forward on the full [text;image] seq."""
+                        cos: torch.Tensor, sin: torch.Tensor,
+                        return_kv_img_from: int | None = None):
+    """Manual FluxSingleTransformerBlock forward on the full [text;image] seq.
+    return_kv_img_from=T additionally returns the image-token (k, v) — k post-rope
+    (rope depends on position only), v raw — for the anchor K/V cache (Lever B).
+    No extra GEMMs: the same k/v used for attention are sliced."""
     residual = x
     normed, gate = block.norm(x, emb=temb)
     mlp_h = block.act_mlp(block.proj_mlp(normed))
@@ -108,6 +112,57 @@ def _single_block_dense(block, x: torch.Tensor, temb: torch.Tensor,
     o = F.scaled_dot_product_attention(q, k, v)
     o = _unheads(o).to(x.dtype)
 
+    out = block.proj_out(torch.cat([o, mlp_h], dim=2))
+    hidden = residual + gate.unsqueeze(1) * out
+    if return_kv_img_from is not None:
+        T = return_kv_img_from
+        return hidden, k[:, :, T:], v[:, :, T:]
+    return hidden
+
+
+def _single_block_sparse_kv(
+    block,
+    q_fresh: torch.Tensor,        # [B, Sq, D]   fresh states: [text ; hard image]
+    q_pos: torch.Tensor,          # [B, Sq]      absolute positions in the joint seq
+    hard_idx: torch.Tensor,       # [B, k]       hard positions on the IMAGE grid
+    T: int,
+    temb: torch.Tensor,
+    cos: torch.Tensor, sin: torch.Tensor,
+    k_img_cache: torch.Tensor,    # [B, H, N, d] anchor image K (post-rope)
+    v_img_cache: torch.Tensor,    # [B, H, N, d] anchor image V
+) -> torch.Tensor:
+    """Lever B: sparse block with the anchor K/V cache. Norm/K/V/MLP run only on
+    the Sq fresh rows; easy image tokens contribute K/V frozen from the anchor
+    (temb_a) — exact at the anchor step, a controlled temb-staleness
+    approximation afterwards. Single-stream linear cost drops from
+    D²(10·Sq + 2·S) to 12·Sq·D²."""
+    residual = q_fresh
+    q_norm, gate = block.norm(q_fresh, emb=temb)
+    mlp_h = block.act_mlp(block.proj_mlp(q_norm))
+
+    attn = block.attn
+    q = _heads(attn.to_q(q_norm), attn.heads)
+    k_new = _heads(attn.to_k(q_norm), attn.heads)
+    v_new = _heads(attn.to_v(q_norm), attn.heads)
+    if attn.norm_q is not None:
+        q = attn.norm_q(q)
+    if attn.norm_k is not None:
+        k_new = attn.norm_k(k_new)
+    cos_q = cos[q_pos].unsqueeze(1)
+    sin_q = sin[q_pos].unsqueeze(1)
+    q = _rope_apply(q, cos_q, sin_q)
+    k_new = _rope_apply(k_new, cos_q, sin_q)          # text + hard rows, post-rope
+
+    # scatter fresh hard K/V into the anchor image cache (dim 2 = token axis)
+    idx = hard_idx[:, None, :, None].expand(-1, k_img_cache.shape[1], -1,
+                                            k_img_cache.shape[-1])
+    k_img = k_img_cache.scatter(2, idx, k_new[:, :, T:].to(k_img_cache.dtype))
+    v_img = v_img_cache.scatter(2, idx, v_new[:, :, T:].to(v_img_cache.dtype))
+    K = torch.cat([k_new[:, :, :T], k_img.to(k_new.dtype)], dim=2)
+    V = torch.cat([v_new[:, :, :T], v_img.to(v_new.dtype)], dim=2)
+
+    o = F.scaled_dot_product_attention(q, K, V)
+    o = _unheads(o).to(q_fresh.dtype)
     out = block.proj_out(torch.cat([o, mlp_h], dim=2))
     return residual + gate.unsqueeze(1) * out
 
@@ -147,7 +202,8 @@ def _single_block_sparse(
 
 # ------------------------------------------------------------------- runner ---
 def estimate_transformer_macs(T: int, N: int, k: int, n_dual: int, n_single: int,
-                              D: int, mlp_mult: int = 4) -> dict:
+                              D: int, mlp_mult: int = 4,
+                              kv_cached: bool = False) -> dict:
     """Analytic MAC estimate for one forward (Fix 10). Sparse execution does NOT
     make everything sparse; per single-stream block only Q / MLP / proj_out and
     the query-side attention shrink to Sq = T + k, while context norm and K/V
@@ -162,9 +218,11 @@ def estimate_transformer_macs(T: int, N: int, k: int, n_dual: int, n_single: int
     dual = n_dual * ((4 + 2 * m) * (N + T) * D * D + 2 * S * S * D)
     # single block dense: q/k/v 3·S·D², mlp m·S·D², proj_out (1+m)·S·D², attn 2·S²·D
     single_dense = n_single * ((3 + m + 1 + m) * S * D * D + 2 * S * S * D)
-    # single block sparse: q Sq + k/v 2·S, mlp m·Sq, proj_out (1+m)·Sq, attn 2·Sq·S·D
+    # single block sparse: q Sq + k/v (2·S dense / 2·Sq with the anchor KV cache),
+    # mlp m·Sq, proj_out (1+m)·Sq, attn 2·Sq·S·D
+    kv_rows = 2 * Sq if kv_cached else 2 * S
     single_sparse = n_single * (
-        ((1 + m + 1 + m) * Sq + 2 * S) * D * D + 2 * Sq * S * D)
+        ((1 + m + 1 + m) * Sq + kv_rows) * D * D + 2 * Sq * S * D)
     final_dense = N * D * 64
     final_sparse = k * D * 64
     dense = dual + single_dense + final_dense
@@ -235,6 +293,7 @@ class FluxSparseRunner:
         txt_ids: torch.Tensor,
         cache: FluxAnchorCache | None = None,  # pass to record an anchor
         step_index: int = -1,
+        record_kv: bool = False,               # Lever B: also record image K/V per block
     ):
         x, ctx, temb, cos, sin = self._embed(
             packed_model_input, prompt_embeds, pooled, timestep, guidance, img_ids, txt_ids)
@@ -249,6 +308,11 @@ class FluxSparseRunner:
         for block in self.t.single_transformer_blocks:
             if cache is not None:
                 cache.record_single_input(cat[:, T:])
+                if record_kv:
+                    cat, k_img, v_img = _single_block_dense(
+                        block, cat, temb, cos, sin, return_kv_img_from=T)
+                    cache.record_single_kv(k_img, v_img)
+                    continue
             cat = _single_block_dense(block, cat, temb, cos, sin)
 
         v = self._final(cat[:, T:], temb)
@@ -272,6 +336,7 @@ class FluxSparseRunner:
         txt_ids: torch.Tensor,
         cache: FluxAnchorCache,
         hard_idx: torch.Tensor,                # [B, k] image-token indices
+        kv_cache: bool = False,                # Lever B: anchor K/V for easy tokens
     ):
         """Selective refresh. Returns (v_hard [B,k,64], stats).
         The sampler merges: v = scatter(cache.final_prediction, hard_idx, v_hard)."""
@@ -297,18 +362,28 @@ class FluxSparseRunner:
 
         q_fresh = torch.cat([q_text, q_hard], dim=1)
         attn_frac, lin_frac = 0.0, 0.0
+        if kv_cache:
+            assert cache.single_block_kv, \
+                "kv_cache=True requires dense_forward(..., record_kv=True) at the anchor"
         for j, block in enumerate(self.t.single_transformer_blocks):
-            cached_img = cache.single_block_inputs[j]               # [B, N, D] anchor depth-j
-            ctx_img = _scatter_tokens(cached_img.to(x.dtype), hard_idx, q_fresh[:, T:])
-            full_ctx = torch.cat([q_fresh[:, :T], ctx_img], dim=1)  # fresh text + mixed image
-            q_fresh = _single_block_sparse(block, q_fresh, full_ctx, q_pos, temb, cos, sin)
+            if kv_cache:
+                k_img, v_img = cache.single_block_kv[j]
+                q_fresh = _single_block_sparse_kv(block, q_fresh, q_pos, hard_idx, T,
+                                                  temb, cos, sin, k_img, v_img)
+                lin_frac += (T + k) / S              # K/V도 Sq행으로 축소
+            else:
+                cached_img = cache.single_block_inputs[j]           # [B, N, D] anchor depth-j
+                ctx_img = _scatter_tokens(cached_img.to(x.dtype), hard_idx, q_fresh[:, T:])
+                full_ctx = torch.cat([q_fresh[:, :T], ctx_img], dim=1)
+                q_fresh = _single_block_sparse(block, q_fresh, full_ctx, q_pos, temb, cos, sin)
+                lin_frac += (T + k) / S
             attn_frac += (T + k) / S
-            lin_frac += (T + k) / S
         n_single = len(self.t.single_transformer_blocks)
 
         v_hard = self._final(q_fresh[:, T:], temb)                  # [B, k, 64]
         macs = estimate_transformer_macs(
-            T, N, k, len(self.t.transformer_blocks), n_single, x.shape[-1])
+            T, N, k, len(self.t.transformer_blocks), n_single, x.shape[-1],
+            kv_cached=kv_cache)
         stats = ForwardStats(
             mode="sparse",
             hard_ratio=k / N,

@@ -133,3 +133,43 @@ def test_runner_glue_fresh_cache_exactness():
 if __name__ == "__main__":
     test_runner_glue_fresh_cache_exactness()
     print("PASS runner-glue exactness")
+
+
+def test_kv_cache_exact_at_anchor_step():
+    """Lever B: anchor step에서는 temb가 같으므로 kv_cache 경로도 EXACT여야 하고,
+    (mock에서) 다른 temb로 흉내낸 later step에서는 exact가 깨져야 한다(근사임 확인)."""
+    torch.manual_seed(1)
+    torch.set_default_dtype(torch.float64)
+    B, T, hp, wp = 1, 7, 4, 6
+    N = hp * wp
+    t = MockFluxTransformer(in_ch=32, joint_dim=48, pooled_dim=24)
+    runner = FluxSparseRunner(t)
+    x = torch.randn(B, N, 32); pe = torch.randn(B, T, 48); po = torch.randn(B, 24)
+    ts = torch.full((B,), 0.5); gd = torch.full((B,), 30.0)
+    img_ids = prepare_latent_image_ids(hp, wp, "cpu", torch.float64)
+    txt_ids = torch.zeros(T, 3)
+
+    cache = FluxAnchorCache()
+    v_dense, _ = runner.dense_forward(x, pe, po, ts, gd, img_ids, txt_ids,
+                                      cache=cache, step_index=0, record_kv=True)
+    assert len(cache.single_block_kv) == len(t.single_transformer_blocks)
+
+    hard = torch.sort(torch.randperm(N)[:8]).values[None]
+    v_hard, st = runner.sparse_forward(x, pe, po, ts, gd, img_ids, txt_ids,
+                                       cache, hard, kv_cache=True)
+    ref = torch.gather(v_dense, 1, hard.unsqueeze(-1).expand(-1, -1, v_dense.shape[-1]))
+    err = (v_hard - ref).abs().max().item()
+    print(f"kv-cache anchor-step exactness: max|dv| = {err:.3e}")
+    assert err < 1e-10
+    assert st.est_transformer_mac_ratio < 1.0
+
+    # later step 흉내: 같은 z, 다른 timestep -> kv 경로는 non-kv 경로와 달라야 함
+    ts2 = torch.full((B,), 0.4)
+    v_kv, _ = runner.sparse_forward(x, pe, po, ts2, gd, img_ids, txt_ids,
+                                    cache, hard, kv_cache=True)
+    v_nk, _ = runner.sparse_forward(x, pe, po, ts2, gd, img_ids, txt_ids,
+                                    cache, hard, kv_cache=False)
+    d = (v_kv - v_nk).abs().max().item()
+    print(f"kv staleness at different temb: max|d| = {d:.3e} (>0 expected)")
+    assert d > 1e-8
+    torch.set_default_dtype(torch.float32)

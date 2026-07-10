@@ -38,6 +38,8 @@ def main():
                     help="which scheduler step to test at (0 = t=1.0)")
     ap.add_argument("--guidance", type=float, default=30.0)
     ap.add_argument("--ratios", type=float, nargs="+", default=[0.1, 0.3, 0.7])
+    ap.add_argument("--kv-cache", action="store_true",
+                    help="Lever B 경로 검사 (anchor와 동일 step이므로 역시 exact 기준)")
     ap.add_argument("--fp32", action="store_true")
     a = ap.parse_args()
 
@@ -71,7 +73,8 @@ def main():
     cache = FluxAnchorCache()
     v_dense, _ = runner.dense_forward(model_input, state.prompt_embeds, state.pooled,
                                       timestep, state.guidance, state.img_ids,
-                                      state.txt_ids, cache=cache, step_index=a.step_index)
+                                      state.txt_ids, cache=cache, step_index=a.step_index,
+                                      record_kv=a.kv_cache)
     scale = v_dense.float().abs().max().item()
     print(f"[Gate B2] step {a.step_index}: max|v_dense| = {scale:.3e} "
           f"(in-distribution check; 랜덤 입력이면 1e4+로 폭발)")
@@ -83,7 +86,8 @@ def main():
         hard = torch.sort(torch.randperm(N, device=dev)[:k]).values[None]
         v_hard, _ = runner.sparse_forward(model_input, state.prompt_embeds,
                                           state.pooled, timestep, state.guidance,
-                                          state.img_ids, state.txt_ids, cache, hard)
+                                          state.img_ids, state.txt_ids, cache, hard,
+                                          kv_cache=a.kv_cache)
         v_merged = runner.merge_prediction(cache, hard, v_hard)
         ref = torch.gather(v_dense, 1,
                            hard.unsqueeze(-1).expand(-1, -1, v_dense.shape[-1]))

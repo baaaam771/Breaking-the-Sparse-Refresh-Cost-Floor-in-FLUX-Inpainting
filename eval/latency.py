@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--resolution", type=int, default=512)
     ap.add_argument("--text-len", type=int, default=512)
     ap.add_argument("--ratios", type=float, nargs="+", default=[0.1, 0.3, 0.5, 0.7])
+    ap.add_argument("--kv-cache", action="store_true")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--out", default="latency.json")
     a = ap.parse_args()
@@ -68,7 +69,8 @@ def main():
     txt_ids = torch.zeros(a.text_len, 3, device=dev, dtype=dtype)
 
     report = {"resolution": a.resolution, "tokens": N,
-              "scope": "transformer-only (denoise loop, VAE, text enc excluded)"}
+              "scope": "transformer-only (denoise loop, VAE, text enc excluded)",
+              "kv_cache": a.kv_cache}
     cache = FluxAnchorCache()
     torch.cuda.reset_peak_memory_stats()
     report["dense"] = _timeit(lambda: runner.dense_forward(
@@ -76,7 +78,8 @@ def main():
     report["dense"]["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
     torch.cuda.reset_peak_memory_stats()
     report["anchor(record)"] = _timeit(lambda: runner.dense_forward(
-        x, pe, po, ts, gd, img_ids, txt_ids, cache=cache, step_index=0), a.iters)
+        x, pe, po, ts, gd, img_ids, txt_ids, cache=cache, step_index=0,
+        record_kv=a.kv_cache), a.iters)
     report["anchor(record)"]["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
     report["cache_vram_gb"] = cache.vram_bytes() / 2**30
 
@@ -85,13 +88,15 @@ def main():
         hard = torch.sort(torch.randperm(N, device=dev)[:k]).values[None]
         torch.cuda.reset_peak_memory_stats()
         report[f"sparse_r{r}"] = _timeit(lambda: runner.sparse_forward(
-            x, pe, po, ts, gd, img_ids, txt_ids, cache, hard), a.iters)
+            x, pe, po, ts, gd, img_ids, txt_ids, cache, hard,
+            kv_cache=a.kv_cache), a.iters)
         report[f"sparse_r{r}"]["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
         D = (comps.transformer.config.num_attention_heads
              * comps.transformer.config.attention_head_dim)
         report[f"sparse_r{r}"]["est_mac_ratio"] = estimate_transformer_macs(
             a.text_len, N, k, len(comps.transformer.transformer_blocks),
-            len(comps.transformer.single_transformer_blocks), D)["mac_ratio"]
+            len(comps.transformer.single_transformer_blocks), D,
+            kv_cached=a.kv_cache)["mac_ratio"]
         report[f"sparse_r{r}"]["speedup_vs_dense"] = (
             report["dense"]["median_ms"] / report[f"sparse_r{r}"]["median_ms"])
 
