@@ -1,6 +1,7 @@
 # Stage 6: plug-in draft (selector-only 먼저, correction은 이후)
 draft_type: cnn_router               # cnn_router | dit_router | unet | flux_early_exit
 router: {width: 96, depth: 4, tau: 1.0e-4}
-teacher_dataset: /mnt/HDD_12TB/bam_ki/flux_fill/router_teacher
+teacher_dataset: /mnt/HDD_12TB/bam_ki/flux_fill/router_teacher_1024
+label_mode: quantile   # top-30% = positive (선택이 top-k ranking으로 소비됨)
 train: {lr: 1.0e-4, weight_decay: 1.0e-4, steps: 100000, ema: 0.999, grad_clip: 1.0}
 roles: [selector]                    # A: selector -> B: temporal correction -> C: replacement(비교군)

@@ -24,7 +24,23 @@ from pathlib import Path
 
 import torch
 
+import torch.nn.functional as _F
+
 from models.drafts.cnn_router import CNNRouter, router_bce_loss
+
+
+def quantile_labels(v_now, v_anchor, q: float):
+    """y_i = 1[change_i > per-sample quantile q]. Selector는 top-k RANKING으로
+    소비되므로 절대 임계(tau)보다 분위 라벨이 목적과 정합적 (FLUX v 스케일에
+    대한 tau 재보정도 불필요)."""
+    d = (v_now - v_anchor).pow(2).mean(-1)               # [B, N]
+    thr = torch.quantile(d, q, dim=1, keepdim=True)
+    return (d > thr).float()
+
+
+def router_quantile_loss(logits, v_now, v_anchor, q: float):
+    return _F.binary_cross_entropy_with_logits(
+        logits, quantile_labels(v_now, v_anchor, q))
 
 
 class TeacherPairs:
@@ -85,14 +101,16 @@ def _save_ckpt(path: Path, step, model, ema, opt, keep=3):
 
 
 @torch.no_grad()
-def _auroc(model, pairs, rng, device, tau, n_batches=20, bs=8):
+def _auroc(model, pairs, rng, device, tau, n_batches=20, bs=8,
+           label_mode="tau", q=0.7):
     """Threshold-free ranking quality of the router on held-out shards."""
     model.eval()
     scores, labels = [], []
     for _ in range(n_batches):
         lat, mt, va, sig, vn, hw = pairs.batch(bs, rng, device)
         logits = model(lat, mt, va, sig, hw)
-        y = ((vn - va).pow(2).mean(-1) > tau).float()
+        y = (quantile_labels(vn, va, q) if label_mode == "quantile"
+             else ((vn - va).pow(2).mean(-1) > tau).float())
         scores.append(logits.flatten().cpu())
         labels.append(y.flatten().cpu())
     s, y = torch.cat(scores), torch.cat(labels)
@@ -114,6 +132,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--tau", type=float, default=1e-4)
+    ap.add_argument("--label-mode", choices=["quantile", "tau"], default="quantile")
+    ap.add_argument("--quantile", type=float, default=0.7)
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--cache-periods", type=int, nargs="+", default=[2, 3, 4, 5])
@@ -150,7 +170,9 @@ def main():
         model.train()
         lat, mt, va, sig, vn, hw = train.batch(a.bs, rng, dev)
         logits = model(lat, mt, va, sig, hw)
-        loss = router_bce_loss(logits, vn, va, a.tau)
+        loss = (router_quantile_loss(logits, vn, va, a.quantile)
+                if a.label_mode == "quantile"
+                else router_bce_loss(logits, vn, va, a.tau))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
@@ -162,7 +184,8 @@ def main():
                 be.copy_(bm)
 
         if (step + 1) % a.eval_every == 0:
-            auc = _auroc(ema, val, vrng, dev, a.tau)
+            auc = _auroc(ema, val, vrng, dev, a.tau,
+                         label_mode=a.label_mode, q=a.quantile)
             print(f"step {step+1}: loss {loss.item():.4f}  val AUROC(EMA) {auc:.4f}")
         if (step + 1) % a.save_every == 0 or step + 1 == a.steps:
             p = _save_ckpt(out, step + 1, model, ema, opt)
