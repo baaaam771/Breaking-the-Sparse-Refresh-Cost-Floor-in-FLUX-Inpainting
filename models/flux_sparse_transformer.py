@@ -481,6 +481,76 @@ class FluxSparseRunner:
 
     # -------------------------------------------------------------- sparse ---
     @torch.no_grad()
+    def teacache_forward(
+        self,
+        packed_model_input: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        tc: dict,                              # TeaCache state (아래 키 참조)
+    ):
+        """Faithful port of the OFFICIAL TeaCache4FLUX policy (ali-vilab/TeaCache,
+        teacache_flux.py) to this runner. Preserved verbatim:
+          - indicator: first dual block's AdaLN-modulated image input
+            `transformer_blocks[0].norm1(x_embed, emb=temb)[0]`
+          - accumulated rescaled rel-L1 with the official FLUX poly1d
+            coefficients; skip while `accumulated < rel_l1_thresh`, else compute
+            and reset
+          - forced compute at the first and last step (cnt==0 / num_steps-1)
+          - reuse: hidden-space residual added to the x_embedder output, then
+            the final head (`norm_out`/`proj_out`) only
+          - previous_modulated_input updated EVERY step (skip or not)
+        Adaptations (documented in the paper): FLUX.1 *Fill* checkpoint
+        (in_ch 384) and its guidance-distilled temb; rescaling coefficients
+        transferred from FLUX-dev as the repo itself recommends for
+        same-architecture models.
+        tc keys: cnt, num_steps, rel_l1_thresh, accumulated, prev_mod,
+        prev_residual. Returns (v, should_calc)."""
+        import numpy as _np
+        x, ctx, temb, cos, sin = self._embed(
+            packed_model_input, prompt_embeds, pooled, timestep, guidance,
+            img_ids, txt_ids)
+
+        modulated_inp = self.t.transformer_blocks[0].norm1(x.clone(),
+                                                           emb=temb.clone())[0]
+        if tc["cnt"] == 0 or tc["cnt"] == tc["num_steps"] - 1:
+            should_calc = True
+            tc["accumulated"] = 0.0
+        else:
+            coeffs = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01,
+                      -3.82021401e+00, 2.64230861e-01]          # 공식 FLUX 계수
+            rescale = _np.poly1d(coeffs)
+            rel = ((modulated_inp - tc["prev_mod"]).abs().mean()
+                   / tc["prev_mod"].abs().mean()).cpu().item()
+            tc["accumulated"] += float(rescale(rel))
+            if tc["accumulated"] < tc["rel_l1_thresh"]:
+                should_calc = False
+            else:
+                should_calc = True
+                tc["accumulated"] = 0.0
+        tc["prev_mod"] = modulated_inp
+        tc["cnt"] += 1
+        if tc["cnt"] == tc["num_steps"]:
+            tc["cnt"] = 0
+
+        T = ctx.shape[1]
+        if not should_calc:
+            x_out = x + tc["prev_residual"]
+        else:
+            ori = x.clone()
+            x2, ctx2 = self._dual_stream(x, ctx, temb, cos, sin)
+            cat = torch.cat([ctx2, x2], dim=1)
+            for block in self.t.single_transformer_blocks:
+                cat = _single_block_dense(block, cat, temb, cos, sin)
+            x_out = cat[:, T:]
+            tc["prev_residual"] = x_out - ori
+        v = self._final(x_out, temb)
+        return v, should_calc
+
+    @torch.no_grad()
     def sparse_forward(
         self,
         packed_model_input: torch.Tensor,

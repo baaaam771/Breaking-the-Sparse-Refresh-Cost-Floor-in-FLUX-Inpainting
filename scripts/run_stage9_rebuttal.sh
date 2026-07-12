@@ -10,21 +10,29 @@ MAN=${MAN:-data/coco_manifest_1024.json}; OUT=${OUT:?set OUT}; N=${N:-500}; RES=
 PC=${PC:-}; PCARG=(); [ -n "$PC" ] && PCARG=(--prompt-cache "$PC")
 DREF=$OUT/dense_s50
 
-# fix3-A: 새 OUT에서 한 명령으로 smoke 가능하게 core arm 자동 생성
+# fix3-A/fix5-2: core arm을 개별 확인·생성 — 일부만 중단된 smoke도 이어서 복구
 BOOTSTRAP_CORE=${BOOTSTRAP_CORE:-0}
-if [[ "$BOOTSTRAP_CORE" == "1" && ! -d "$DREF" ]]; then
-  core() { python -m samplers.cached_flux_fill --manifest $MAN --out $OUT \
-           --limit $N --steps 50 "${PCARG[@]}" "$@"; }
-  core --method dense --tag dense_s50
-  core --method dense --steps 30 --tag dense_s30
-  core --method reuse --cache-period 2 --dense-tail 4 --tag reuse_c2_t4
-  core --method cache_sparse --selector mbd --cache-period 2 --ratio 0.3 \
-       --dense-tail 4 --dual-sparse --kv-cache --tag mbd_c2_r03_t4_dualkv
-  core --method cache_sparse --selector mbd --cache-period 2 --ratio 0.3 \
-       --dense-tail 4 --kv-cache --tag mbd_c2_r03_t4_kv
+run_core_if_missing() {
+  local tag=$1; shift
+  if [[ ! -f "$OUT/$tag/run.json" ]]; then
+    python -m samplers.cached_flux_fill --manifest "$MAN" --out "$OUT" \
+      --limit "$N" "${PCARG[@]}" "$@" --tag "$tag"
+  fi
+}
+if [[ "$BOOTSTRAP_CORE" == "1" ]]; then
+  run_core_if_missing dense_s50 --method dense --steps 50
+  run_core_if_missing dense_s30 --method dense --steps 30
+  run_core_if_missing reuse_c2_t4 --method reuse --steps 50 \
+    --cache-period 2 --dense-tail 4
+  run_core_if_missing mbd_c2_r03_t4_dualkv --method cache_sparse --steps 50 \
+    --selector mbd --cache-period 2 --ratio 0.3 --dense-tail 4 \
+    --dual-sparse --kv-cache
+  run_core_if_missing mbd_c2_r03_t4_kv --method cache_sparse --steps 50 \
+    --selector mbd --cache-period 2 --ratio 0.3 --dense-tail 4 --kv-cache
   for D in dense_s30 reuse_c2_t4 mbd_c2_r03_t4_dualkv mbd_c2_r03_t4_kv; do
-    python -m eval.region_metrics --run $OUT/$D --ref $DREF --manifest $MAN \
-      --out $OUT/$D/metrics.json
+    test -f $OUT/$D/metrics.json || \
+      python -m eval.region_metrics --run $OUT/$D --ref $DREF --manifest $MAN \
+        --out $OUT/$D/metrics.json
   done
 fi
 
@@ -88,8 +96,11 @@ hs = {}
 for p in glob.glob(f"{out}/*/fidkid.json"):
     d = json.load(open(p))
     hs[p.split("/")[-2]] = (d.get("eval_set_hash"), d.get("eval_set_size"))
+if not hs:
+    print("WARN: no fidkid.json files found; eval-set identity check skipped.")
+    sys.exit(0)
 if len(set(hs.values())) > 1:
     print("EVAL-SET MISMATCH:", hs); sys.exit(1)
-print(f"eval-set identity OK: {len(hs)} arms, "
-      f"hash={next(iter(hs.values()))[0]} size={next(iter(hs.values()))[1]}")
+value = next(iter(hs.values()))
+print(f"eval-set identity OK: {len(hs)} arms, hash={value[0]} size={value[1]}")
 PY

@@ -283,3 +283,33 @@ P1-3 memory 표 (peak alloc/reserved/cache/activation × res × ratio).
 P2-1 router transfer matrix (r0.15/0.5, c3, FFHQ, 768/1536, g10/50 중 3~4개).
 P2-2 kernel breakdown (proj/attn/FFN/gather-scatter/cache IO 프로파일).
 P1-1 2nd backbone은 인페인팅 ckpt 가용성 확인 후 결정 (없으면 P0-1/P0-2 우선).
+
+### Stage 10: faithful TeaCache (P0-1) — 구현 완료
+공식 ali-vilab/TeaCache TeaCache4FLUX 소스 분석 후 runner에 teacache_forward
+이식. 보존(verbatim): 첫 dual block norm1 modulated input 판정신호, FLUX poly1d
+계수 [498.65, -283.78, 55.86, -3.82, 0.264], 누적 rel-L1 + thresh 판정+리셋,
+cnt==0/last 강제 dense, hidden-space residual(x_embed+residual->final head),
+prev_mod 매 step 갱신. Adaptation(논문 명시): Fill ckpt(384ch), guidance temb,
+계수 transfer(repo 권장 관행). 표기: "TeaCache (adapted to FLUX Fill)".
+mock 테스트 2종 통과. run_stage10_teacache.sh: 공식 운영점 {0.25,0.4,0.6,0.8}
+sweep -> wallmatch. 주의: skip step 비용 = embed+norm1+final head (수 ms) —
+speedup 상한은 dense step 수가 결정.
+
+### fix4 반영 (smoke 실패 원인 = validator 설계 오류 2개)
+1. steps를 GLOBAL 키에서 제거 — dense step-reduction baseline은 의도적으로
+   다른 step 수 (dense_s30=30). --steps는 그룹 판별용으로만.
+2. scheduler provenance 분리: scheduler_base_config_sha256 (runtime 필드
+   timesteps/sigmas/num_inference_steps/_step_index/_begin_index 제거 후 hash,
+   전 arm 동일해야) + timesteps_sha256/sigmas_sha256 (같은 step 그룹 내에서만
+   비교; 30 vs 50 다른 건 정상).
+3. bootstrap 조건: 디렉터리 존재 -> run.json 존재.
+4. git_dirty WARN 문구에 "최종 표/5K는 clean commit에서 재생성" 명시.
+검증: smoke 시나리오(RC 0, WARN만) + 그룹 내 schedule 오염(RC 1) 모두 재현.
+기존 stage9_smoke12 core run은 유지·재사용 (구/신 provenance 혼재는 WARN 통과).
+
+### fix5 반영 (경계 조건 3개)
+1. validator 성공 메시지/docstring에서 steps 제거 (로그 혼동 방지).
+2. run_core_if_missing: core 5 arm을 개별 확인·생성 — 부분 중단 smoke 복구
+   가능 (metrics.json도 개별 확인).
+3. eval-set hash 검사: fidkid.json 0개면 WARN+skip (FID 패키지 누락 시
+   StopIteration 방지).

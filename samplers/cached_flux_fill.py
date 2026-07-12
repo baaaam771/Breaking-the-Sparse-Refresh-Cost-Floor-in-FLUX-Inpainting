@@ -117,6 +117,12 @@ def get_model_provenance(pipe) -> dict:
         return _hl.sha256(_js.dumps(dict(cfg), sort_keys=True,
                                     default=str).encode()).hexdigest()
 
+    def _tensor_sha(t):
+        if t is None:
+            return None
+        arr = t.detach().cpu().contiguous().numpy()
+        return _hl.sha256(arr.tobytes()).hexdigest()
+
     def _git(*args):
         try:
             return _sp.check_output(["git", *args], text=True,
@@ -133,7 +139,14 @@ def get_model_provenance(pipe) -> dict:
         "model_revision": getattr(t.config, "_commit_hash", None),
         "transformer_config_sha256": _cfg_sha(t.config),
         "scheduler_class": type(pipe.scheduler).__name__,
-        "scheduler_config_sha256": _cfg_sha(pipe.scheduler.config),
+        # base config: 실행 중 변하는 runtime 필드 제거 후 hash (전 arm 동일해야)
+        "scheduler_base_config_sha256": _cfg_sha({
+            k: v for k, v in dict(pipe.scheduler.config).items()
+            if k not in ("timesteps", "sigmas", "num_inference_steps",
+                         "_step_index", "_begin_index")}),
+        # runtime schedule: 같은 step 수 arm끼리만 같아야 (30 vs 50은 달라야 정상)
+        "timesteps_sha256": _tensor_sha(getattr(pipe.scheduler, "timesteps", None)),
+        "sigmas_sha256": _tensor_sha(getattr(pipe.scheduler, "sigmas", None)),
         "code_commit": _git("rev-parse", "HEAD"),
         "git_dirty": bool(status) if status is not None else None,
     }
@@ -188,6 +201,7 @@ def sample_one(pipe, runner: FluxSparseRunner, state: FluxFillState, *,
                block: int, mask_px: torch.Tensor, freq_source: str,
                dense_head: int = 0, dense_tail: int = 0, kv_cache: bool = False,
                dual_sparse: bool = False, teacache_thresh: float = 0.15,
+               teacache_rel_l1: float = 0.4,
                sample_seed_offset: int = 0, dump_selection: list | None = None,
                draft=None, log: dict | None = None):
     """Runs one image through the chosen method; mutates state.latents; returns
@@ -201,6 +215,8 @@ def sample_one(pipe, runner: FluxSparseRunner, state: FluxFillState, *,
     n_anchor = n_sparse = 0
     n_forced_dense = n_thresh_reuse = 0
     last_anchor_sigma = None
+    tc = {"cnt": 0, "num_steps": n_steps, "rel_l1_thresh": teacache_rel_l1,
+          "accumulated": 0.0, "prev_mod": None, "prev_residual": None}
     attn_fracs, mac_ratios, actual_ratios = [], [], []
     hetero_rows = []
     v_prev = None
@@ -211,6 +227,19 @@ def sample_one(pipe, runner: FluxSparseRunner, state: FluxFillState, *,
         # schedule-aware policy: hetero 측정에서 마지막 ~4 step은 변화가 mask 밖으로
         # 퍼지고(in/out 25x -> 0.4) energy가 튐 -> 그 구간은 무조건 dense(anchor).
         forced_dense = (i < dense_head) or (i >= n_steps - dense_tail)
+        if method == "teacache":
+            model_input = torch.cat([state.latents, state.cond], dim=2)
+            timestep = t.expand(1).to(state.latents.dtype) / 1000
+            v, calc = runner.teacache_forward(
+                model_input, state.prompt_embeds, state.pooled, timestep,
+                state.guidance, state.img_ids, state.txt_ids, tc)
+            if calc:
+                n_anchor += 1          # full compute
+            else:
+                n_thresh_reuse += 1    # residual reuse (final head only)
+            state.latents = scheduler_step(pipe, v, t, state.latents)
+            continue
+
         _anchored = ("reuse", "cache_sparse", "temporal_thresh",
                      "uniform_grid", "contiguous_block")
         is_anchor = (method in _anchored) and \
@@ -342,14 +371,18 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--method",
                     choices=["dense", "reuse", "cache_sparse", "hetero",
-                             "temporal_thresh", "uniform_grid", "contiguous_block"],
+                             "temporal_thresh", "uniform_grid", "contiguous_block",
+                             "teacache"],
                     required=True)
     ap.add_argument("--selector", default="mask",
                     choices=list(PRESETS) + ["random", "oracle"])
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--cache-period", type=int, default=3)
     ap.add_argument("--teacache-thresh", type=float, default=0.15,
-                    help="TeaCache adapted: anchor 이후 sigma 상대변화 임계")
+                    help="temporal_thresh control: anchor 이후 sigma 상대변화 임계")
+    ap.add_argument("--teacache-rel-l1", type=float, default=0.4,
+                    help="faithful TeaCache: accumulated rescaled rel-L1 임계 "
+                         "(공식 운영점 0.25/0.4/0.6/0.8)")
     ap.add_argument("--ratio", type=float, default=0.3)
     ap.add_argument("--block", type=int, default=1,
                     help="structured selection window in tokens (Stage 7): 1, 2, 4")
@@ -428,6 +461,7 @@ def main():
                    dense_head=a.dense_head, dense_tail=a.dense_tail,
                    kv_cache=a.kv_cache, dual_sparse=a.dual_sparse,
                    teacache_thresh=a.teacache_thresh,
+                   teacache_rel_l1=a.teacache_rel_l1,
                    sample_seed_offset=(s["latent_seed"] + a.seed_offset) * 131 + i,
                    dump_selection=(sel_dump := [] if a.dump_selection else None),
                    draft=draft, log=log)
