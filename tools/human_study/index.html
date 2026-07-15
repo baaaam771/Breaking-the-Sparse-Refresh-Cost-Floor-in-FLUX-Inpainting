@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Inpainting pairwise study</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #fafafa; }
+  #top { padding: 10px 16px; background: #fff; border-bottom: 1px solid #ddd;
+         display: flex; gap: 16px; align-items: center; }
+  #imgs { display: flex; gap: 8px; justify-content: center; padding: 12px; }
+  #imgs figure { margin: 0; text-align: center; }
+  #imgs img { max-width: 31vw; border: 1px solid #ccc; }
+  figcaption { font-size: 13px; color: #555; padding: 4px; }
+  #qs { max-width: 860px; margin: 0 auto; padding: 0 16px 32px; }
+  .q { margin: 10px 0; padding: 10px 14px; background: #fff;
+       border: 1px solid #ddd; border-radius: 8px; }
+  .q b { display: block; margin-bottom: 6px; }
+  .q button { margin-right: 8px; padding: 6px 18px; font-size: 14px;
+              border: 1px solid #bbb; border-radius: 6px; background: #f5f5f5;
+              cursor: pointer; }
+  .q button.sel { background: #2563eb; color: #fff; border-color: #2563eb; }
+  #nav { margin-top: 14px; display: flex; gap: 10px; align-items: center; }
+  #nav button { padding: 8px 22px; font-size: 15px; }
+  #done { display: none; text-align: center; padding: 40px; }
+  kbd { background: #eee; border-radius: 3px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <label>평가자 이름: <input id="rater" placeholder="이름/이니셜"></label>
+  <span id="prog"></span>
+  <span style="color:#777;font-size:13px">
+    단축키 — Q1: <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> ·
+    Q2: <kbd>q</kbd><kbd>w</kbd><kbd>e</kbd> ·
+    Q3: <kbd>a</kbd><kbd>s</kbd><kbd>d</kbd> ·
+    다음: <kbd>Enter</kbd></span>
+</div>
+<div id="imgs">
+  <figure><img id="imref"><figcaption>입력 + 마스크(빨간 영역이 채워진 부분)</figcaption></figure>
+  <figure><img id="imL"><figcaption>왼쪽</figcaption></figure>
+  <figure><img id="imR"><figcaption>오른쪽</figcaption></figure>
+</div>
+<div id="qs">
+  <div class="q" id="q0"><b>Q1. 마스크(빨간) 영역의 내용이 더 자연스러운 쪽은?</b>
+    <button data-v="L">왼쪽</button><button data-v="T">비슷함</button><button data-v="R">오른쪽</button></div>
+  <div class="q" id="q1"><b>Q2. 채워진 영역과 주변의 경계가 더 잘 어울리는 쪽은?</b>
+    <button data-v="L">왼쪽</button><button data-v="T">비슷함</button><button data-v="R">오른쪽</button></div>
+  <div class="q" id="q2"><b>Q3. 전체적으로 더 선호하는 이미지는?</b>
+    <button data-v="L">왼쪽</button><button data-v="T">비슷함</button><button data-v="R">오른쪽</button></div>
+  <div id="nav">
+    <button id="prev">← 이전</button>
+    <button id="next">다음 →</button>
+    <button id="export" style="margin-left:auto">결과 저장(JSON)</button>
+  </div>
+</div>
+<div id="done"><h2>완료되었습니다. "결과 저장(JSON)"을 눌러 파일을 전달해 주세요.</h2></div>
+<script>
+let P = null, idx = 0, ans = {};
+const KEY = "hs_" + location.pathname;
+fetch("pairs.json").then(r => r.json()).then(d => {
+  P = d; ans = JSON.parse(localStorage.getItem(KEY) || "{}");
+  idx = Math.min(Object.keys(ans).length, P.pairs.length - 1);
+  show();
+});
+function show() {
+  const p = P.pairs[idx], k = String(p.id).padStart(4, "0");
+  imref.src = `img/${k}_ref.jpg`; imL.src = `img/${k}_L.jpg`; imR.src = `img/${k}_R.jpg`;
+  prog.textContent = `${idx + 1} / ${P.pairs.length}`;
+  const cur = ans[p.id] || {};
+  for (let q = 0; q < 3; q++)
+    document.querySelectorAll(`#q${q} button`).forEach(b =>
+      b.classList.toggle("sel", cur[`q${q}`] === b.dataset.v));
+}
+function set(q, v) {
+  const p = P.pairs[idx];
+  ans[p.id] = ans[p.id] || {};
+  ans[p.id][`q${q}`] = v;
+  localStorage.setItem(KEY, JSON.stringify(ans));
+  show();
+}
+document.querySelectorAll(".q").forEach((el, q) =>
+  el.querySelectorAll("button").forEach(b =>
+    b.onclick = () => set(q, b.dataset.v)));
+function complete(p) { const a = ans[p.id]; return a && a.q0 && a.q1 && a.q2; }
+next.onclick = () => {
+  if (!complete(P.pairs[idx])) { alert("세 질문에 모두 답해 주세요."); return; }
+  if (idx < P.pairs.length - 1) { idx++; show(); }
+  else { document.getElementById("qs").style.display = "none";
+         document.getElementById("imgs").style.display = "none";
+         document.getElementById("done").style.display = "block"; }
+};
+prev.onclick = () => { if (idx > 0) { idx--; show(); } };
+window.export_btn = 0;
+document.getElementById("export").onclick = () => {
+  const name = rater.value.trim();
+  if (!name) { alert("평가자 이름을 입력해 주세요."); return; }
+  const blob = new Blob([JSON.stringify(
+    { rater: name, comparison: P.comparison, answers: ans }, null, 1)],
+    { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `ratings_${P.comparison}_${name}.json`;
+  a.click();
+};
+const KEYMAP = { "1": [0,"L"], "2": [0,"T"], "3": [0,"R"],
+                 "q": [1,"L"], "w": [1,"T"], "e": [1,"R"],
+                 "a": [2,"L"], "s": [2,"T"], "d": [2,"R"] };
+document.addEventListener("keydown", ev => {
+  if (ev.target.tagName === "INPUT") return;
+  if (ev.key === "Enter") { next.onclick(); return; }
+  const m = KEYMAP[ev.key.toLowerCase()];
+  if (m) set(m[0], m[1]);
+});
+</script>
+</body>
+</html>
