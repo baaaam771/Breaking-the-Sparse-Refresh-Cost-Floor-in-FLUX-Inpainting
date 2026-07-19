@@ -55,13 +55,16 @@ def _load(run_dir: Path):
     # sweep의 4개 threshold가 같은 설정의 seed들처럼 평균돼 표가 오염됨.
     tc_thresh = (cfg.get("teacache_rel_l1")
                  if cfg["method"] == "teacache" else None)
+    # adaptive tail: 운영점을 정의하는 파라미터 — sig에 없으면 fixed t0와
+    # adaptive run들이 seed처럼 병합됨 (Stage 11에서 실제 발생).
+    ad_tail = cfg.get("adaptive_tail", 0.0) or None
     sig = (cfg["method"], cfg["steps"],
            cfg.get("cache_period") if cfg["method"] != "dense" else None,
            cfg.get("ratio") if cfg["method"] == "cache_sparse" else None,
            cfg.get("block", 1) if cfg["method"] == "cache_sparse" else None,
            cfg.get("selector") if cfg["method"] == "cache_sparse" else None,
            tail, bool(cfg.get("kv_cache", False)),
-           bool(cfg.get("dual_sparse", False)), tc_thresh)
+           bool(cfg.get("dual_sparse", False)), tc_thresh, ad_tail)
     if run["rows"]:
         r0 = next((r for r in run["rows"] if not r.get("warmup")),
                   run["rows"][0])
@@ -101,9 +104,11 @@ def main():
 
     table, csv_rows = [], []
     for sig, Ls in groups.items():
-        method, steps, c, r, block, selector, tail, kv, dual, tc_thresh = sig
+        (method, steps, c, r, block, selector, tail, kv, dual, tc_thresh,
+         ad_tail) = sig
         if method == "teacache":
             selector = f"rel-L1={tc_thresh}"
+
         row = {"Method": method, "Steps": steps,
                "Anchor c": c if c is not None else "-",
                "Ratio r(req)": r if r is not None else "-",
@@ -112,7 +117,8 @@ def main():
                "Selector": selector if selector is not None else "-",
                "KV": ("Y" if kv else "-"),
                "Dual": ("Y" if dual else "-"),
-               "Tail": ("-" if tail is None else
+               "Tail": (f"ad{ad_tail}" if ad_tail else
+                        "-" if tail is None else
                         (f"h{tail[0]}+t{tail[1]}" if tail[0] else f"t{tail[1]}")
                         if tail and (tail[0] or tail[1]) else
                         ("0" if tail is not None else "-")),
