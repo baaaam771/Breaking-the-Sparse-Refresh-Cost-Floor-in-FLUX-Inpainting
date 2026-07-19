@@ -41,6 +41,26 @@ def _timeit(fn, iters, warmup=3):
 
 
 @torch.no_grad()
+def load_transformer_only(resolution: int, text_len: int = 512):
+    """transformer-only 벤치 입력 준비 (latency/floor-curve/breakdown 공용)."""
+    comps = load_flux_fill(keep_text_encoders=False)
+    dev, dtype = comps.device, comps.dtype
+    grid = TokenGrid(resolution, resolution).validate()
+    hp, wp = grid.token_hw
+    N = grid.num_image_tokens
+    x = torch.randn(1, N, 384, device=dev, dtype=dtype)
+    pe = torch.randn(1, text_len, comps.transformer.config.joint_attention_dim,
+                     device=dev, dtype=dtype)
+    po = torch.randn(1, comps.transformer.config.pooled_projection_dim,
+                     device=dev, dtype=dtype)
+    ts = torch.full((1,), 0.5, device=dev, dtype=dtype)
+    gd = torch.full((1,), 30.0, device=dev, dtype=torch.float32) \
+        if comps.transformer.config.guidance_embeds else None
+    img_ids = prepare_latent_image_ids(hp, wp, dev, dtype)
+    txt_ids = torch.zeros(text_len, 3, device=dev, dtype=dtype)
+    return comps, x, pe, po, ts, gd, img_ids, txt_ids
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--resolution", type=int, default=512)
@@ -52,23 +72,11 @@ def main():
     ap.add_argument("--out", default="latency.json")
     a = ap.parse_args()
 
-    comps = load_flux_fill(keep_text_encoders=False)
-    dev, dtype = comps.device, comps.dtype
+    comps, x, pe, po, ts, gd, img_ids, txt_ids = load_transformer_only(
+        a.resolution, a.text_len)
     runner = FluxSparseRunner(comps.transformer)
-    grid = TokenGrid(a.resolution, a.resolution).validate()
-    hp, wp = grid.token_hw
-    N = grid.num_image_tokens
-
-    x = torch.randn(1, N, 384, device=dev, dtype=dtype)
-    pe = torch.randn(1, a.text_len, comps.transformer.config.joint_attention_dim,
-                     device=dev, dtype=dtype)
-    po = torch.randn(1, comps.transformer.config.pooled_projection_dim,
-                     device=dev, dtype=dtype)
-    ts = torch.full((1,), 0.5, device=dev, dtype=dtype)
-    gd = torch.full((1,), 30.0, device=dev, dtype=torch.float32) \
-        if comps.transformer.config.guidance_embeds else None
-    img_ids = prepare_latent_image_ids(hp, wp, dev, dtype)
-    txt_ids = torch.zeros(a.text_len, 3, device=dev, dtype=dtype)
+    dev = x.device
+    N = x.shape[1]
 
     report = {"resolution": a.resolution, "tokens": N,
               "scope": "transformer-only (denoise loop, VAE, text enc excluded)",

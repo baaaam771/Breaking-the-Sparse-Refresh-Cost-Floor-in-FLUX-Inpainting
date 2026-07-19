@@ -38,6 +38,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -65,6 +67,16 @@ def _heads(x: torch.Tensor, n_heads: int) -> torch.Tensor:
 def _unheads(x: torch.Tensor) -> torch.Tensor:
     B, H, S, d = x.shape
     return x.transpose(1, 2).reshape(B, S, H * d)
+
+
+_PROFILE = os.environ.get("FLUX_PROFILE") == "1"
+if _PROFILE:
+    from torch.profiler import record_function as _rf
+else:
+    import contextlib
+
+    def _rf(name):                     # noqa: D401 — zero-cost stand-in
+        return contextlib.nullcontext()
 
 
 def _gather_tokens(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -446,15 +458,20 @@ class FluxSparseRunner:
         if cache is not None and record_dual:
             # manual dual loop (== stock: Gate B0-dual) so inputs/K/V can be recorded
             for blk in self.t.transformer_blocks:
-                cache.record_dual_input(x)
+                with _rf("cache_record"):
+                    cache.record_dual_input(x)
                 if record_kv:
-                    ctx, x, k_img, v_img = _dual_block_dense(
-                        blk, x, ctx, temb, cos, sin, return_kv_img=True)
-                    cache.record_dual_kv(k_img, v_img)
+                    with _rf("dual_stream"):
+                        ctx, x, k_img, v_img = _dual_block_dense(
+                            blk, x, ctx, temb, cos, sin, return_kv_img=True)
+                    with _rf("cache_record"):
+                        cache.record_dual_kv(k_img, v_img)
                 else:
-                    ctx, x = _dual_block_dense(blk, x, ctx, temb, cos, sin)
+                    with _rf("dual_stream"):
+                        ctx, x = _dual_block_dense(blk, x, ctx, temb, cos, sin)
         else:
-            x, ctx = self._dual_stream(x, ctx, temb, cos, sin)
+            with _rf("dual_stream"):
+                x, ctx = self._dual_stream(x, ctx, temb, cos, sin)
 
         T = ctx.shape[1]
         cat = torch.cat([ctx, x], dim=1)
@@ -463,15 +480,20 @@ class FluxSparseRunner:
             cache.entry_image_states = x.detach()
         for block in self.t.single_transformer_blocks:
             if cache is not None:
-                cache.record_single_input(cat[:, T:])
+                with _rf("cache_record"):
+                    cache.record_single_input(cat[:, T:])
                 if record_kv:
-                    cat, k_img, v_img = _single_block_dense(
-                        block, cat, temb, cos, sin, return_kv_img_from=T)
-                    cache.record_single_kv(k_img, v_img)
+                    with _rf("single_kv_recompute"):
+                        cat, k_img, v_img = _single_block_dense(
+                            block, cat, temb, cos, sin, return_kv_img_from=T)
+                    with _rf("cache_record"):
+                        cache.record_single_kv(k_img, v_img)
                     continue
-            cat = _single_block_dense(block, cat, temb, cos, sin)
+            with _rf("single_kv_recompute"):
+                cat = _single_block_dense(block, cat, temb, cos, sin)
 
-        v = self._final(cat[:, T:], temb)
+        with _rf("final_head"):
+            v = self._final(cat[:, T:], temb)
         if cache is not None:
             cache.finish_anchor(v, ctx, x)
             cache.image_token_positions = torch.arange(
@@ -583,17 +605,20 @@ class FluxSparseRunner:
         if dual_sparse:
             assert cache.dual_block_inputs or cache.dual_block_kv, \
                 "dual_sparse requires dense_forward(..., record_dual=True) at the anchor"
-            x_hard = _gather_tokens(x, hard_idx)
+            with _rf("sparse_overhead"):
+                x_hard = _gather_tokens(x, hard_idx)
             for j, blk in enumerate(self.t.transformer_blocks):
                 kv = cache.dual_block_kv[j] if (kv_cache and cache.dual_block_kv) else None
                 cached_in = None if kv is not None else cache.dual_block_inputs[j]
-                ctx, x_hard = _dual_block_sparse(
-                    blk, x_hard, ctx, hard_idx, q_pos, T, temb, cos, sin,
-                    cached_img_in=cached_in, kv_img_cache=kv)
+                with _rf("dual_stream"):
+                    ctx, x_hard = _dual_block_sparse(
+                        blk, x_hard, ctx, hard_idx, q_pos, T, temb, cos, sin,
+                        cached_img_in=cached_in, kv_img_cache=kv)
             q_text, q_hard = ctx, x_hard
         else:
             # dual stream dense — full image token set (PoC safety rule)
-            x, ctx = self._dual_stream(x, ctx, temb, cos, sin)
+            with _rf("dual_stream"):
+                x, ctx = self._dual_stream(x, ctx, temb, cos, sin)
             q_text = ctx
             q_hard = _gather_tokens(x, hard_idx)
 
@@ -605,19 +630,26 @@ class FluxSparseRunner:
         for j, block in enumerate(self.t.single_transformer_blocks):
             if kv_cache:
                 k_img, v_img = cache.single_block_kv[j]
-                q_fresh = _single_block_sparse_kv(block, q_fresh, q_pos, hard_idx, T,
-                                                  temb, cos, sin, k_img, v_img)
+                with _rf("single_kv_cached"):
+                    q_fresh = _single_block_sparse_kv(block, q_fresh, q_pos,
+                                                      hard_idx, T, temb, cos,
+                                                      sin, k_img, v_img)
                 lin_frac += (T + k) / S              # K/V도 Sq행으로 축소
             else:
                 cached_img = cache.single_block_inputs[j]           # [B, N, D] anchor depth-j
-                ctx_img = _scatter_tokens(cached_img.to(x.dtype), hard_idx, q_fresh[:, T:])
-                full_ctx = torch.cat([q_fresh[:, :T], ctx_img], dim=1)
-                q_fresh = _single_block_sparse(block, q_fresh, full_ctx, q_pos, temb, cos, sin)
+                with _rf("sparse_overhead"):
+                    ctx_img = _scatter_tokens(cached_img.to(x.dtype), hard_idx,
+                                              q_fresh[:, T:])
+                    full_ctx = torch.cat([q_fresh[:, :T], ctx_img], dim=1)
+                with _rf("single_kv_recompute"):
+                    q_fresh = _single_block_sparse(block, q_fresh, full_ctx,
+                                                   q_pos, temb, cos, sin)
                 lin_frac += (T + k) / S
             attn_frac += (T + k) / S
         n_single = len(self.t.single_transformer_blocks)
 
-        v_hard = self._final(q_fresh[:, T:], temb)                  # [B, k, 64]
+        with _rf("final_head"):
+            v_hard = self._final(q_fresh[:, T:], temb)              # [B, k, 64]
         macs = estimate_transformer_macs(
             T, N, k, len(self.t.transformer_blocks), n_single, D,
             kv_cached=kv_cache, dual_sparse=dual_sparse)
