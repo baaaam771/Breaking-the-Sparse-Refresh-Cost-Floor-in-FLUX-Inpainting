@@ -21,7 +21,6 @@ def _one(pipe, runner, res, ratio, kv, dual):
     from samplers.dense_flux_fill import prepare_flux_fill_inputs
     from models.flux_cache import FluxAnchorCache
     from token_selectors.combo import select_hard_tokens
-    from types import SimpleNamespace
     from PIL import Image
     import numpy as np
 
@@ -37,19 +36,22 @@ def _one(pipe, runner, res, ratio, kv, dual):
     cache = FluxAnchorCache()
     model_input = torch.cat([state.latents, state.cond], dim=2)
     t = state.timesteps[0].expand(1).to(state.latents.dtype) / 1000
+    use_cache = cache if (kv or dual) else None      # base = 순수 dense
     v, _ = runner.dense_forward(model_input, state.prompt_embeds, state.pooled,
                                 t, state.guidance, state.img_ids, state.txt_ids,
-                                cache=cache, record_kv=kv, record_dual=dual,
+                                cache=use_cache, record_kv=kv, record_dual=dual,
                                 step_index=0)
-    cache.set_anchor_context(state.latents, float(state.sigmas[0]))
-    N = state.latents.shape[1]
-    hp = wp = int(N ** 0.5)
-    grid = SimpleNamespace(token_hw=(hp, wp))
-    scores = torch.rand(1, N, device=dev)
-    hard, _, _ = select_hard_tokens(scores, grid, ratio, block=1)
-    _ = runner.sparse_forward(model_input, state.prompt_embeds, state.pooled,
-                              t, state.guidance, state.img_ids, state.txt_ids,
-                              cache, hard, kv_cache=kv, dual_sparse=dual)
+    if kv or dual:
+        # sparse 경로는 anchor cache가 필요 — base(레버 없음)는 dense-only 측정
+        sigma0 = pipe.scheduler.sigmas[0].to(state.latents.device)
+        cache.set_anchor_context(state.latents, sigma0)
+        N = state.latents.shape[1]
+        scores = torch.rand(1, N, device=dev)
+        hard, _, _ = select_hard_tokens(scores, state.grid, ratio, block=1)
+        _ = runner.sparse_forward(model_input, state.prompt_embeds,
+                                  state.pooled, t, state.guidance,
+                                  state.img_ids, state.txt_ids,
+                                  cache, hard, kv_cache=kv, dual_sparse=dual)
     stats = torch.cuda.memory_stats()
 
     def _sz(ts):
