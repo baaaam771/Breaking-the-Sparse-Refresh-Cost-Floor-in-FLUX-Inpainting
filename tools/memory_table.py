@@ -65,15 +65,19 @@ def _one(pipe, runner, res, ratio, kv, dual):
                 n += t.numel() * t.element_size()
         return n / 2**30
 
+    # dual_block_inputs 등은 begin_anchor()에서 동적 생성 — base(cache 미사용)
+    # 조합에서는 존재하지 않으므로 getattr로 안전 접근.
+    g = lambda name: getattr(cache, name, [])
     cache_gb = {
-        "states": _sz(cache.single_block_inputs) + _sz(cache.dual_block_inputs)
+        "states": _sz(g("single_block_inputs")) + _sz(g("dual_block_inputs"))
                   + _sz([cache.entry_image_states, cache.entry_text_states,
                          cache.final_prediction, cache.anchor_latents,
                          cache.anchor_clean_estimate]),
-        "single_kv": _sz(cache.single_block_kv),
-        "dual_kv": _sz(cache.dual_block_kv),
+        "single_kv": _sz(g("single_block_kv")),
+        "dual_kv": _sz(g("dual_block_kv")),
     }
-    assert abs(sum(cache_gb.values()) - cache.vram_bytes() / 2**30) < 1e-6
+    if kv or dual:      # vram_bytes도 동적 속성을 읽으므로 base에선 비교 불가
+        assert abs(sum(cache_gb.values()) - cache.vram_bytes() / 2**30) < 1e-6
     return {
         "peak_alloc_gb": stats["allocated_bytes.all.peak"] / 2**30,
         "peak_reserved_gb": stats["reserved_bytes.all.peak"] / 2**30,
