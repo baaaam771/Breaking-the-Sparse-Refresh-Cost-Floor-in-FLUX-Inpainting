@@ -395,3 +395,156 @@ run과 eval/latency.py 격리 측정만 사용.
 rows=[] (fresh=0). assemble 방어: wall=None(표 "-", resume이면 "-*"),
 evals=("-","-","-"), CSV mean도 빈 리스트 가드. end-to-end 검증: 표/CSV
 정상 출력, quality·Imgs는 metrics 기반이라 영향 없음.
+
+### Human study 도구 (P0-2) 완성
+tools/human_study/: prepare_pairs.py(층화: random N + large box/polygon
+subset, pair별 좌우 무작위 고정, 라벨 숨김, input+mask 참조 오버레이 생성,
+자체완결 study 폴더) + index.html(3질문 분리, 단축키, localStorage 진행저장,
+JSON export) + aggregate.py(win/tie/loss + win-rate bootstrap 95% CI +
+이미지당 다수결 + subset 분해 + 평가자 일치도). mock 3-rater E2E 검증.
+운영: N=500 출력으로 3개 비교(ours vs dense30/dense40/reuse) x (100+50)쌍,
+평가자 3인+. dense40이 없으면 stage9_n500에 dense_s40 1 arm 추가 생성 필요.
+
+### Human study blinding 구조화 (운영 리뷰 반영)
+라벨을 key.json으로 물리 분리 — 평가자 전달 파일(pairs.json/index.html/img)
+어디에도 method 정보 없음 (검증: public label-free assert). key.json은
+실험자 보관, aggregate가 study 폴더에서 읽음. RATER_README.txt + serve.sh
+(정적 서버 옵션) 동봉. 운영 규칙: study 출력은 repo 밖
+(/mnt/.../human_studies/) — 5K arm들의 git_dirty 오염 방지.
+
+### Stage 11 (acceptance polish) 준비 완료
+A) P1-4 budget sweep r{0.05,0.1,0.2,0.4,0.5} — sweet spot 폭 증명 (~4h)
+B) P1-2 tail K{0..8}\{4} + adaptive-tail{0.02,0.05} 대조 (~6h)
+   sampler --adaptive-tail: sparse step에서 anchor 대비 상대에너지 임계 초과
+   시 잔여 전부 dense, adaptive_switch_step 기록.
+C) P1-3 memory 표: tools/memory_table.py — res x lever별 peak alloc/reserved
+   + cache 구성(states/single_kv/dual_kv) 분해, vram_bytes 총합 assert (~1h)
+D) P2-1 router transfer 3점: r0.15(+동일 r mbd 짝) / g10 / FFHQ —
+   DRAFT_CKPT/G10_REF/FFHQ_REF 환경변수, ckpt 없으면 자동 생략 (~3h)
+실행: 5K 종료 후 OUT=stage9_n100 재사용 (ref 공유). run/met 멱등(존재 시 skip).
+
+### Stage 12: 2nd-MMDiT cost-transfer (P1-1 축소판, 리뷰 설계 그대로)
+Claim 한정: "cost-model and cost-removal transfer" (method/selector/frontier
+전이는 주장하지 않음).
+1. tools/mmdit_cost_model.py — 일반화 blockwise MAC (dual+single vs all-dual),
+   프리셋 flux-fill/sd35-large/medium. 로컬 실행 결과가 리뷰 예측 재현:
+   naive floor FLUX 0.39 vs SD3.5-L 0.67 (all-dual의 K/V 재계산 부담),
+   +KV로 양쪽 <0.1, dualkv r0.15 ~0.12. floor의 원인 = block composition.
+   주의: 논문 §6.3의 0.49는 dual-dense 보수 변형 — 각주로 정의 명시 예정.
+2. models/sd3_sparse_runner.py — SD3 joint block 수동 실행 + naive/kv/dualkv.
+3. tools/sd3_exactness.py — official vs manual (bf16 전체 + fp32 블록별),
+   fresh-cache kv/dualkv hard-row == dense. in-distribution latent 사용.
+4. tools/sd3_latency.py — 512/1024 x lever x r{.15,.3}: median latency,
+   speedup, analytic MAC, realization, VRAM.
+5. scripts/run_stage12_sd3.sh — analytic -> exactness(FAIL시 중단) -> latency.
+요구: SD3.5 HF gated 동의 + hf auth login. 총 ~1-2h (다운로드 별도).
+
+### Stage 12 v2 (P0 6개 전부 반영)
+1. cost model 재정의 -> 논문 lever 1:1: naive(보수 정책: dual dense + single
+   sparse) FLUX r->0 = 0.486 ~= 논문 0.49 재현, SD3 = 1.000 (all-dual은
+   sparse-eligible 블록 없음 -> "dual sparsification이 필수"). dual(Lever A:
+   text fully fresh + img KV 2N 재계산) FLUX 0.230/SD3 0.193. dualkv(A+B:
+   img KV 캐시 + hard 2k) floor = text 비용 (FLUX 0.111/SD3 0.075, 0 아님);
+   FLUX dualkv@r.15 = 0.244 ~= 논문 0.24.
+2. runner v2: text 스트림 모든 변형에서 fully fresh (Q/K/V/O/FF), 캐시는
+   이미지 K/V만 + hard 행 fresh scatter, easy 행은 depth별 anchor 상태
+   (img_states 길이 n+1, final 출력 포함). naive는 runner에서 제외(=dense).
+   CPU mock fresh-cache 검증: dual/dualkv 오차 0.
+3. exactness v2: official forward로 순차 진행하며 target 블록에서 같은
+   in-distribution 입력 비교 (경로 왜곡 제거), transformer.float()를 embed
+   전에, rel+max_abs 동시 판정 (fp32 rel<1e-5, bf16 rel<3e-2, fresh-cache
+   rel<1e-3), 실패 시 SystemExit(1) 직접.
+4. latency: lever = dense/dual/dualkv + naive 행은 "= dense (paper policy)"
+   명시. 5. shell: set -euo pipefail + 전 변수 quote + grep 게이트 제거.
+
+### Stage 12: SD3.5 dual_attention_layers (attn2) 지원
+runner: _norm1 분기(7-tuple), dense에 attn2(image-only self-attn, FFN 전) +
+self_img_kv 기록; sparse에 attn2 hard-Q + (dual: 2N 재계산 / dualkv: 캐시
++hard scatter). exactness helper 동일 반영. cost model: attn2_dense =
+n_attn2(4N D²+2N²D), sparse = (2k+kv2)D²+2kND; naive는 attn2 dense 포함.
+latency가 config.dual_attention_layers에서 n_attn2 자동 로드 (Large=0,
+Medium=13 — 어느 쪽이 와도 안전). mock(attn2 블록 포함) fresh-cache
+dual/dualkv 오차 0 재검증.
+
+### Stage 12 최종 보강
+1. exactness [2]: full-output rel + hard rel 동시 검사 (fresh cache면 easy
+   행도 dense와 동일해야 — 최종 scatter/easy 경로 오류 검출). mock 검증:
+   dual/dualkv 모두 full rel 0.
+2. latency: dense를 anchor cache 생성 **전에** 측정 (empty_cache +
+   reset_peak) -> dense peak VRAM이 순수값. sparse 행은 cache 상주 상태
+   (실사용 조건). 표에 각주로 명시.
+3. realization = measured speedup x analytic MAC ratio (= measured/predicted),
+   기존 `(1/pred) and (sp/(1/pred))` 정리.
+
+### Stage 11 첫 실행 실패 원인 (수정)
+--adaptive-tail argparse 정의가 로컬 파일에서부터 누락 — Stage 11 작업 시
+치환 anchor 불일치로 silent no-op (컴파일 검사는 통과해 미검출). 교훈:
+argparse 추가는 --help 렌더링 assert로 검증해야 함 (이번에 적용, 5개 플래그
+전부 확인). 괄호 균형 기반 삽입으로 멀티라인 문장 파손도 방지.
+
+### Stage 11 결과: A+B 완주, C 버그 수정
+A(r-sweep 5) + B(tail 7 + adaptive 2) 전 arm fresh=100 완주. C(memory_table)
+버그 2개 수정: (1) state.sigmas 없음 -> pipe.scheduler.sigmas[0] 사용,
+(2) base(레버 없음) 조합이 sparse_forward의 cache assert에 걸림 -> base는
+순수 dense-only 측정(cache=None)으로 재정의, grid는 state.grid(실제
+TokenGrid) 사용. API 전수 대조 완료 (dense_forward 반환/finish_anchor 내장/
+selector 시그니처). 서버에서 같은 명령 재실행 시 A/B skip -> assemble ->
+C -> D 이어짐.
+
+### memory_table 3차 수정 (동적 속성)
+FluxAnchorCache의 dual_block_inputs/single_block_kv/dual_block_kv는 dataclass
+필드가 아니라 begin_anchor()에서 동적 생성 — base(cache=None) 조합에서 빈
+객체 분해 시 AttributeError. getattr(cache, name, []) 안전 접근 + vram_bytes
+교차 assert는 kv/dual 셀에서만. CPU 검증: 빈 cache 분해 0, populated 시
+vram_bytes 합계 일치.
+
+### Stage 11 표 오염 발견·수정 (adaptive_tail sig)
+table_polish.md에서 t0 행이 Seeds=3 — adaptive_tail이 assemble sig에 없어
+pol_tail0 + pol_adapt002/005가 seed처럼 병합 (wall 13.34±2.50 비정상 분산이
+증거; TeaCache 때와 동일 유형). 수정: sig에 ad_tail 추가, Tail 컬럼에
+"ad0.02" 표기 (tail 튜플 인덱싱 파손 우회 — 표기부에서 분기). 3행 분리 검증.
+r-sweep/t1–t8은 오염 없음(각 단일 run) — 즉시 논문 반영 가능; t0/adaptive는
+서버 assemble 재실행 후 확정.
+
+### Stage 12 OOM 수정 (진단 문서 반영)
+증상: fp32 depth 루프에서 94.9GB 소진 (bf16 full [1]과 block0 [1b]는 통과).
+원인 3중: (a) fp32 루프의 official block 호출이 no_grad 밖 -> 38블록
+autograd 그래프 축적(주범), (b) 전체 transformer.float() = 8B x2 VRAM,
+(c) 텍스트 인코더 3개(T5-XXL 포함)+VAE 상주.
+수정: exactness main에 @torch.inference_mode(), encode 후 인코더/VAE
+CPU offload + empty_cache, fp32는 대상 블록만 승격-검사-즉시복원
+(depth progression은 bf16 official). latency에도 동일 가드.
+mock 검증: 승격/복원 사이클 dtype 정상.
+
+### Stage 12 gate 임계 수정 — 이번엔 실제 반영 (2차)
+1차 시도가 old-string 불일치로 silent no-op (변수명 hard_rel/full_rel 버전이
+실제 파일; grep 검증이 head의 exit 0에 가려짐). 교훈 재확인: 치환 후
+내용 assert 필수 (적용됨: 신규 임계 존재 + 구 gate 부재 + [2b] 존재 assert).
+반영: FULL 3e-3 / HARD 6e-3 (bf16 커널 배치 차이; official-vs-manual 4.6e-3
+동규모), threshold 로그 표기, [2b] cache-consistency (dual vs dualkv
+rel<1e-6 — fresh cache에서 재계산==캐시의 직접 증거).
+
+### fig2 좌측 라벨 잘림 수정
+cm-mathtext/serif에서 tight bbox가 ylabel 폭 과소평가 + pad 0.02 과소.
+수정: pad 0.06 시작 + 저장 후 200dpi 렌더의 가장자리 3px 잉크 자동검사,
+검출 시 pad +0.05 재저장(최대 4회) — fig1 bbox 자동검사와 동일 철학.
+mock 렌더: pad=0.06에서 edges clean.
+
+### 총평(종합 리뷰) 반영 + Stage 13/14 구성
+논문 수정 10건 완료: std/variance 표현(3곳+fig1), bit-consistent 정밀화,
+staleness hypothesize, 통계 단위(3x100-image seed-offset runs), dense 보간
+격하(actual dense-40 전면), 기여 4->3 압축(router optional 격하), abstract
+~18% 압축(training-free vs optional router 분리), suppl H FID 프로토콜
+상세(clean-fid/raw·composite 정의/CI 근거), baseline applicability 표,
+Q 순서 roadmap 문장, "pure pure" 오타. 제목 변경은 사용자 결정 대기.
+실험 3종 구성:
+- Stage 13-A (scripts/run_stage13_gpu2.sh): 추가 GPU latency — env.json 기록,
+  FLUX 4-lever x r{.15,.3} x 해상도, iters 100 (p10 추가), summary 표.
+- Stage 13-B (run_stage13_dense_curve.sh): dense {20,25,27,34,37,41} seed0
+  탐색 + {25,27,37,41} 3-seed (seed별 dense_s50 ref 필수 — SEED_REF_BASE),
+  nearest-dense ΔQ/Δt 직접 비교 표.
+- Stage 14 (run_stage14_sd3_quality.sh + tools/sd3_quality[_eval].py):
+  SD3.5-L t2i 4-arm (dense_ref 28 / dense_matched 자동 step / reuse c2t4 /
+  dualkv c2 r0.3 delta). 계약 검증: timestep 1000-scale 그대로, unpatchify
+  exactness [1] 공식 재사용, anchor 상태는 sampler 로컬(v_anchor/prev) —
+  SD3AnchorCache에 final_prediction 없음. CPU mock 3-mode 완주 검증.

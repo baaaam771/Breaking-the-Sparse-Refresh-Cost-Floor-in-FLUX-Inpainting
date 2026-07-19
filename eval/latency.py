@@ -36,6 +36,7 @@ def _timeit(fn, iters, warmup=3):
         ts.append(time.perf_counter() - t0)
     return {"mean_ms": 1e3 * statistics.mean(ts),
             "median_ms": 1e3 * statistics.median(ts),
+            "p10_ms": 1e3 * sorted(ts)[max(int(0.1 * len(ts)) - 1, 0)],
             "p90_ms": 1e3 * sorted(ts)[int(0.9 * len(ts)) - 1]}
 
 
