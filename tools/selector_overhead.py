@@ -83,6 +83,8 @@ def main():
         return select_hard_tokens(scores, grid, a.ratio, block=1)
 
     hard, _, _ = _topk()
+    k_actual = hard.shape[1]           # select는 block 정렬/올림으로 k와
+                                       # 1-2개 다를 수 있음 — 실제 크기 사용
 
     def _index_prep():
         idx = hard.unsqueeze(-1).expand(-1, -1, 3072)
@@ -92,7 +94,7 @@ def main():
     # 실제 gather/scatter 비용 — runner와 동일 helper, 동일 shape/dtype
     from models.flux_sparse_transformer import _gather_tokens, _scatter_tokens
     x_state = torch.randn(1, N, 3072, device=dev, dtype=torch.bfloat16)
-    fresh = torch.randn(1, k, 3072, device=dev, dtype=torch.bfloat16)
+    fresh = torch.randn(1, k_actual, 3072, device=dev, dtype=torch.bfloat16)
 
     results = {"mbd_scoring": bench(_score),
                "rank_topk": bench(_topk),
