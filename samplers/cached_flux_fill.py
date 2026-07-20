@@ -106,8 +106,11 @@ class SelectorState:
         # cold-start와 동일한 의미론; mbd는 mask/boundary가 있어 해당 없음).
         if (w.alpha == 0.0 and w.beta == 0.0 and w.gamma == 0.0
                 and w.eta == 0.0 and delta is None):
-            return torch.rand(self.mask_tok.shape, generator=generator,
-                              device="cpu").to(dev)
+            # generator와 device 일치 필수 (서버 generator는 CUDA)
+            gdev = generator.device if generator is not None else dev
+            return random_score(self.mask_tok.shape[0],
+                                self.mask_tok.shape[1],
+                                generator=generator, device=gdev).to(dev)
         return combo_score(w, mask=self.mask_tok.to(dev), boundary=self.bnd_tok.to(dev),
                            frequency=freq, delta=delta, draft=draft_term)
 
