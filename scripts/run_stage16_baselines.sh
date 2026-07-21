@@ -50,6 +50,9 @@ run() { local tag=$1; local n=$2; shift 2
   test -f "$OUT/$tag/run.json" || \
     python -m samplers.cached_flux_fill --manifest $MAN --out $OUT \
       --limit $n "${PCARG[@]}" "$@" --tag "$tag"; }
+met2() { test -f "$OUT/$1/metrics.json" || \
+  python -m eval.region_metrics --run $OUT/$1 --ref $2 --manifest $MAN \
+    --out $OUT/$1/metrics.json; }
 met() { test -f "$OUT/$1/metrics.json" || \
   python -m eval.region_metrics --run $OUT/$1 --ref $DREF --manifest $MAN \
     --out $OUT/$1/metrics.json; }
@@ -162,4 +165,61 @@ PY
   done
   python -m eval.assemble --runs $OUT/*_n300 --out $OUT/table_final.md
   echo "done -> $OUT/table_final.md"
+fi
+
+# ---------- 3단계: selector 3-seed 확정 (§Q3 문장 강화) ----------
+# delta_only vs mbd를 동일 lever(dual+KV, c2, r0.3, tail4)에서
+# N=100 x seed offset {0,1000,2000}로 (N=300 single-seed와 구별되는 진짜
+# 3-seed). 각 seed는 자기 seed의 dense_s50를 ref로 사용.
+#   SEED3=1 SREF_BASE=/mnt/HDD_12TB/bam_ki/flux_fill/out_final \
+#   N3=100 OUT=... bash scripts/run_stage16_baselines.sh
+if [ -n "${SEED3:-}" ]; then
+  N3=${N3:-100}
+  SREF_BASE=${SREF_BASE:-/mnt/HDD_12TB/bam_ki/flux_fill/out_final}
+  for SEL in delta_only mbd; do
+    for SD in 0 1000 2000; do
+      if [ "$SD" = "0" ]; then SREF=$DREF
+      else SREF=$SREF_BASE/seed${SD}/dense_s50; fi
+      test -d "$SREF" || { echo "[skip] $SREF 없음 — seed${SD} 생략"; continue; }
+      run sel3_${SEL}_s${SD} $N3 --method cache_sparse --selector $SEL \
+        --cache-period 2 --ratio 0.3 --dense-tail 4 --kv-cache --dual-sparse \
+        --seed-offset $SD
+      met2 sel3_${SEL}_s${SD} "$SREF"
+    done
+  done
+  # 집계: selector x seed -> mean±std, paired Δ
+  python - << 'PY'
+import json, glob, os, statistics
+out = os.environ["OUT"]
+res = {}
+for sel in ("delta_only", "mbd"):
+    vals = []
+    for sd in (0, 1000, 2000):
+        p = f"{out}/sel3_{sel}_s{sd}/metrics.json"
+        if os.path.exists(p):
+            m = json.load(open(p))["aggregate"].get("mask_lpips_to_ref")
+            if m is not None:
+                vals.append(m)
+    res[sel] = vals
+rows = ["| selector | seeds | mask-LPIPS mean±std | per-seed |",
+        "|---|---|---|---|"]
+for sel, vals in res.items():
+    if not vals:
+        continue
+    mstd = (f"{statistics.mean(vals):.4f}"
+            + (f"±{statistics.stdev(vals):.4f}" if len(vals) > 1 else ""))
+    rows.append(f"| {sel} | {len(vals)} | {mstd} "
+                f"| {', '.join(f'{v:.4f}' for v in vals)} |")
+# paired Δ (동일 seed에서 delta_only - mbd)
+if res.get("delta_only") and res.get("mbd") and \
+        len(res["delta_only"]) == len(res["mbd"]):
+    diffs = [a - b for a, b in zip(res["delta_only"], res["mbd"])]
+    rows.append("")
+    rows.append(f"paired Δ (delta_only − mbd) per seed: "
+                f"{', '.join(f'{d:+.4f}' for d in diffs)}; "
+                f"mean {statistics.mean(diffs):+.4f}")
+open(f"{out}/table_selector_3seed.md", "w").write("\n".join(rows) + "\n")
+print("\n".join(rows))
+PY
+  echo "done -> $OUT/table_selector_3seed.md"
 fi
